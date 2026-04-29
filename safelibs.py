@@ -3,6 +3,7 @@
 
 Usage:
     safelibs.py status [libname ...]
+    safelibs.py sync [libname ...]
     safelibs.py port [libname ...]
     safelibs.py port --jobs 4
     safelibs.py port [libname ...] --filter-upgradeable
@@ -15,6 +16,10 @@ Usage:
     safelibs.py port [libname ...] --push-github
     safelibs.py port [libname ...] --claude
     safelibs.py port [libname ...] --backend claude
+
+Every action that touches a port checkout will fetch, fast-forward pull,
+and push local commits/tags to the GitHub remote so the local working
+copies stay in lockstep with upstream. Use --no-auto-pull to opt out.
 """
 
 import argparse
@@ -440,6 +445,112 @@ def _auto_pull_workdir(workdir, remote, log_handle=None):
     return "pulled"
 
 
+def _auto_push_workdir(workdir, remote, libname=None, log_handle=None):
+    """Push the current branch and local tags to ``remote`` if anything is ahead.
+
+    Soft-fails (logs to stderr) on failure rather than aborting the run, so
+    routine syncs do not turn transient network or auth issues into pipeline
+    failures.
+    """
+    if not _workdir_has_git_history(workdir, log_handle=log_handle):
+        return "no-history"
+
+    if _remote_url(workdir, remote, log_handle=log_handle) is None:
+        _emit(
+            f"Skipping auto-push in {workdir}; remote {remote} is not configured.",
+            log_handle=log_handle,
+        )
+        return "no-remote"
+
+    branch = _git_output(workdir, "branch", "--show-current")
+    if not branch:
+        _emit(
+            f"Skipping auto-push in {workdir}; HEAD is detached.",
+            log_handle=log_handle,
+        )
+        return "detached"
+
+    upstream, ahead, behind = _git_ahead_behind(workdir)
+    if upstream is not None and ahead and behind and ahead > 0 and behind > 0:
+        _emit(
+            f"Skipping auto-push in {workdir}; branch {branch} has diverged "
+            f"from {upstream} (ahead {ahead}, behind {behind}). "
+            "Reconcile manually before pushing.",
+            log_handle=log_handle,
+            stream=sys.stderr,
+        )
+        return "diverged"
+
+    pushed_anything = False
+
+    needs_branch_push = upstream is None or (ahead and ahead > 0)
+    if needs_branch_push:
+        if upstream is None:
+            _emit(
+                f"Auto-pushing {branch} in {workdir} (setting upstream {remote}/{branch})",
+                log_handle=log_handle,
+            )
+            push_command = ["git", "push", "-u", remote, f"{branch}:{branch}"]
+        else:
+            _emit(
+                f"Auto-pushing {ahead} commit(s) on {branch} in {workdir}",
+                log_handle=log_handle,
+            )
+            push_command = ["git", "push", remote, f"{branch}:{branch}"]
+        push_result = _run_optional_command(
+            push_command,
+            cwd=workdir,
+            log_handle=log_handle,
+        )
+        if push_result is None or push_result.returncode != 0:
+            detail = ""
+            if push_result is not None:
+                detail = push_result.stderr.strip() or push_result.stdout.strip()
+            suffix = f": {detail}" if detail else ""
+            _emit(
+                f"Auto-push of {branch} failed in {workdir}{suffix}",
+                log_handle=log_handle,
+                stream=sys.stderr,
+            )
+            return "push-failed"
+        pushed_anything = True
+
+    tag_filter = f"{libname}/*" if libname else None
+    tag_text = (
+        _git_output(workdir, "tag", "--list", tag_filter)
+        if tag_filter
+        else _git_output(workdir, "tag", "--list")
+    )
+    local_tags = [t for t in (tag_text or "").splitlines() if t]
+    if local_tags:
+        tag_result = _run_optional_command(
+            [
+                "git",
+                "push",
+                remote,
+                *[f"refs/tags/{t}:refs/tags/{t}" for t in local_tags],
+            ],
+            cwd=workdir,
+            log_handle=log_handle,
+        )
+        if tag_result is None or tag_result.returncode != 0:
+            detail = ""
+            if tag_result is not None:
+                detail = tag_result.stderr.strip() or tag_result.stdout.strip()
+            suffix = f": {detail}" if detail else ""
+            _emit(
+                f"Auto-push of tags failed in {workdir}{suffix}",
+                log_handle=log_handle,
+                stream=sys.stderr,
+            )
+        else:
+            stdout = (tag_result.stdout + tag_result.stderr).strip()
+            if stdout and ("new tag" in stdout or "->" in stdout):
+                pushed_anything = True
+
+    return "pushed" if pushed_anything else "up-to-date"
+
+
 def _clone_port_repo(remote_url, workdir, log_handle=None):
     parent_dir = os.path.dirname(workdir)
     os.makedirs(parent_dir, exist_ok=True)
@@ -464,7 +575,14 @@ def _clone_port_repo(remote_url, workdir, log_handle=None):
     return False
 
 
-def _sync_port_workdir(workdir, repo_slug, remote, log_handle=None, dry_run=False):
+def _sync_port_workdir(
+    workdir,
+    repo_slug,
+    remote,
+    libname=None,
+    log_handle=None,
+    dry_run=False,
+):
     remote_url = _github_remote_url(repo_slug)
     if _is_git_worktree(workdir):
         if dry_run:
@@ -476,9 +594,21 @@ def _sync_port_workdir(workdir, repo_slug, remote, log_handle=None, dry_run=Fals
                 f"would fetch and fast-forward pull {remote} in {workdir} when clean",
                 log_handle=log_handle,
             )
+            tag_scope = f"{libname}/*" if libname else "all"
+            _emit_dry_run(
+                f"would push local commits and {tag_scope} tags to {remote} in {workdir}",
+                log_handle=log_handle,
+            )
             return "dry-run"
         _ensure_remote_if_missing(workdir, remote, remote_url, log_handle=log_handle)
-        return _auto_pull_workdir(workdir, remote, log_handle=log_handle)
+        pull_status = _auto_pull_workdir(workdir, remote, log_handle=log_handle)
+        _auto_push_workdir(
+            workdir,
+            remote,
+            libname=libname,
+            log_handle=log_handle,
+        )
+        return pull_status
 
     if os.path.exists(workdir) and os.listdir(workdir):
         _emit(
@@ -1674,6 +1804,10 @@ def _emit_subprocess_output(result, *, log_handle=None):
 def _libname_arg(value):
     if not value or "/" in value or value.startswith("-") or value.startswith("."):
         raise argparse.ArgumentTypeError(f"invalid libname: {value!r}")
+    if value == "template":
+        raise argparse.ArgumentTypeError(
+            "'template' is the port scaffold, not a real port; refusing"
+        )
     return value
 
 
@@ -1681,10 +1815,11 @@ def _build_parser():
     parser = argparse.ArgumentParser(description="Run the safelibs pipeline.")
     parser.add_argument(
         "action",
-        choices=["status", "port"],
+        choices=["status", "sync", "port"],
         help=(
-            "Action to run. 'status' reports port status; 'port' runs "
-            "porting phases."
+            "Action to run. 'status' reports port status; 'sync' fetches, "
+            "fast-forward pulls, and pushes local commits/tags for each "
+            "managed port; 'port' runs porting phases."
         ),
     )
     parser.add_argument(
@@ -1839,6 +1974,66 @@ def _pipeline_scripts(log_handle=None):
     return scripts, phases
 
 
+def _sync_one(args, log_handle=None):
+    libname = args.libname
+    ports_dir = os.path.abspath(getattr(args, "ports_dir", DEFAULT_PORTS_DIR))
+    github_owner = getattr(args, "github_owner", DEFAULT_GITHUB_OWNER)
+    github_prefix = getattr(args, "github_prefix", DEFAULT_PORT_REPO_PREFIX)
+    github_remote = getattr(args, "github_remote", "origin")
+    github_repo = getattr(args, "github_repo", None)
+    dry_run = getattr(args, "dry_run", False)
+
+    workdir = _default_port_workdir(libname, ports_dir, github_prefix)
+    repo_slug = _github_repo_slug(
+        libname,
+        github_owner,
+        github_prefix,
+        github_repo=github_repo,
+    )
+    _emit(f"Syncing {libname} ({repo_slug}) at {workdir}", log_handle=log_handle)
+    _sync_port_workdir(
+        workdir,
+        repo_slug,
+        github_remote,
+        libname=libname,
+        log_handle=log_handle,
+        dry_run=dry_run,
+    )
+
+
+def _sync_all(args, log_handle=None):
+    ports_dir = os.path.abspath(getattr(args, "ports_dir", DEFAULT_PORTS_DIR))
+    github_owner = getattr(args, "github_owner", DEFAULT_GITHUB_OWNER)
+    github_prefix = getattr(args, "github_prefix", DEFAULT_PORT_REPO_PREFIX)
+    github_remote = getattr(args, "github_remote", "origin")
+    dry_run = getattr(args, "dry_run", False)
+
+    repos = _known_port_repos(
+        ports_dir, github_owner, github_prefix, log_handle=log_handle
+    )
+    if not repos:
+        _emit(
+            f"No {github_prefix} repositories found in {ports_dir} or "
+            f"github.com/{github_owner}.",
+            log_handle=log_handle,
+        )
+        return
+    for repo in repos:
+        repo_slug = repo.get("repo_slug") or f"{github_owner}/{repo['name']}"
+        _emit(
+            f"Syncing {repo['libname']} ({repo_slug}) at {repo['workdir']}",
+            log_handle=log_handle,
+        )
+        _sync_port_workdir(
+            repo["workdir"],
+            repo_slug,
+            github_remote,
+            libname=repo["libname"],
+            log_handle=log_handle,
+            dry_run=dry_run,
+        )
+
+
 def _status_all(args, phases, log_handle=None):
     ports_dir = os.path.abspath(getattr(args, "ports_dir", DEFAULT_PORTS_DIR))
     github_owner = getattr(args, "github_owner", DEFAULT_GITHUB_OWNER)
@@ -1855,6 +2050,7 @@ def _status_all(args, phases, log_handle=None):
                 repo["workdir"],
                 repo_slug_for_status,
                 github_remote,
+                libname=repo["libname"],
                 log_handle=log_handle,
                 dry_run=dry_run,
             )
@@ -1900,6 +2096,7 @@ def _status_one(args, phases, log_handle=None):
             workdir,
             repo_slug,
             github_remote,
+            libname=libname,
             log_handle=log_handle,
             dry_run=dry_run,
         )
@@ -1957,6 +2154,7 @@ def _run_port_one(
             workdir,
             repo_slug,
             github_remote,
+            libname=libname,
             log_handle=log_handle,
             dry_run=dry_run,
         )
@@ -2214,6 +2412,21 @@ def _run_port_one(
             github_remote,
             log_handle=log_handle,
             dry_run=dry_run,
+        )
+    elif (
+        not dry_run
+        and not getattr(args, "no_auto_pull", False)
+        and _is_git_worktree(workdir)
+    ):
+        if job_reporter is not None:
+            job_reporter.set_status(
+                "pushing", detail=f"Auto-pushing to {github_remote}"
+            )
+        _auto_push_workdir(
+            workdir,
+            github_remote,
+            libname=libname,
+            log_handle=log_handle,
         )
 
     if dry_run:
@@ -2661,6 +2874,16 @@ def _run_pipeline(args, log_handle=None, log_path=None):
             _status_one(per_args, phases, log_handle=log_handle)
         return
 
+    if args.action == "sync":
+        if not libnames:
+            _sync_all(args, log_handle=log_handle)
+            return
+        for libname in libnames:
+            per_args = argparse.Namespace(**vars(args))
+            per_args.libname = libname
+            _sync_one(per_args, log_handle=log_handle)
+        return
+
     if args.from_phase and _find_phase_index(phases, args.from_phase) is None:
         _emit(
             f"Unknown phase '{args.from_phase}'. Available: {phases}",
@@ -2690,7 +2913,7 @@ def main():
     if jobs_was_supplied and args.jobs < 1:
         parser.error("--jobs must be a positive integer")
     libnames = list(args.libname or [])
-    if args.action == "status":
+    if args.action in {"status", "sync"}:
         if args.from_phase or args.from_last:
             parser.error("--from and --from-last can only be used with action 'port'")
         if args.filter_upgradeable:
