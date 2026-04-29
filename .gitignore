@@ -1,0 +1,21 @@
+# Python bytecode
+__pycache__/
+.pytest_cache/
+
+# local artifacts
+logs/
+ports/
+
+# Crash dumps
+core
+core.*
+
+# local pipeline state
+.juvenal-state.json
+libs/
+
+# private key and secret material
+*.secret
+*.private
+private-key*
+/tmp/safelibs-signing-key.asc
