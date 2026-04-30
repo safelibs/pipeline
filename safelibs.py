@@ -7,6 +7,7 @@ Usage:
     safelibs.py port [libname ...]
     safelibs.py port --jobs 4
     safelibs.py port [libname ...] --filter-upgradeable
+    safelibs.py port [libname ...] --filter-tag 04-test
     safelibs.py port --from-validator
     safelibs.py port [libname ...] -L [logfile]
     safelibs.py port [libname ...] --from 01-recon
@@ -1418,6 +1419,27 @@ def _find_last_tagged_phase_index(workdir, libname, phases, log_handle=None):
     return matches[-1]
 
 
+def _tag_in_history(workdir, libname, phase, log_handle=None):
+    """Return True if libname/phase is reachable from HEAD in workdir."""
+    if not _workdir_has_git_history(workdir, log_handle=log_handle):
+        return False
+    tag = f"{libname}/{phase}"
+    result = subprocess.run(
+        ["git", "tag", "--merged", "HEAD", "--list", tag],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        _emit(
+            f"Failed to check tag {tag} in {workdir}: {result.stderr.strip()}",
+            log_handle=log_handle,
+            stream=sys.stderr,
+        )
+        return False
+    return tag in result.stdout.splitlines()
+
+
 def _workdir_has_git_history(workdir, log_handle=None):
     if not os.path.exists(os.path.join(workdir, ".git")):
         return False
@@ -1943,6 +1965,16 @@ def _build_parser():
             "For 'port', first check whether the checked-out source has a "
             "newer upstream Ubuntu package version available; skip the port "
             "when it does not."
+        ),
+    )
+    parser.add_argument(
+        "--filter-tag",
+        dest="filter_tag",
+        metavar="PHASE",
+        default=None,
+        help=(
+            "For 'port', skip libraries whose port checkout does not have a "
+            "<libname>/PHASE tag reachable from HEAD (e.g. '04-test')."
         ),
     )
     parser.add_argument(
@@ -2871,6 +2903,26 @@ def _round_robin_ports(args, scripts, phases, log_handle=None, log_path=None):
         )
         sys.exit(1)
 
+    filter_tag = getattr(args, "filter_tag", None)
+    if filter_tag:
+        kept_repos = []
+        for repo in repos:
+            if _tag_in_history(repo["workdir"], repo["libname"], filter_tag, log_handle=log_handle):
+                kept_repos.append(repo)
+            else:
+                _emit(
+                    f"--filter-tag: skipping {repo['libname']} "
+                    f"(no {repo['libname']}/{filter_tag} tag reachable from HEAD).",
+                    log_handle=log_handle,
+                )
+        _emit(
+            f"--filter-tag {filter_tag}: kept {len(kept_repos)} of {len(repos)} known port(s).",
+            log_handle=log_handle,
+        )
+        if not kept_repos:
+            return
+        repos = kept_repos
+
     if jobs <= 1:
         _emit(
             f"Round-robin porting {len(repos)} known port(s).",
@@ -3076,6 +3128,38 @@ def _run_pipeline(args, log_handle=None, log_path=None):
         )
         sys.exit(1)
 
+    filter_tag = getattr(args, "filter_tag", None)
+    if filter_tag and _find_phase_index(phases, filter_tag) is None:
+        _emit(
+            f"Unknown phase '{filter_tag}' for --filter-tag. Available: {phases}",
+            log_handle=log_handle,
+            stream=sys.stderr,
+        )
+        sys.exit(1)
+
+    if filter_tag and libnames:
+        ports_dir = os.path.abspath(getattr(args, "ports_dir", DEFAULT_PORTS_DIR))
+        github_prefix = getattr(args, "github_prefix", DEFAULT_PORT_REPO_PREFIX)
+        kept = []
+        for libname in libnames:
+            workdir = _default_port_workdir(libname, ports_dir, github_prefix)
+            if _tag_in_history(workdir, libname, filter_tag, log_handle=log_handle):
+                kept.append(libname)
+            else:
+                _emit(
+                    f"--filter-tag: skipping {libname} "
+                    f"(no {libname}/{filter_tag} tag reachable from HEAD).",
+                    log_handle=log_handle,
+                )
+        _emit(
+            f"--filter-tag {filter_tag}: kept {len(kept)} of {len(libnames)} library(ies).",
+            log_handle=log_handle,
+        )
+        if not kept:
+            return
+        libnames = kept
+        args.libname = list(libnames)
+
     if not libnames:
         _round_robin_ports(args, scripts, phases, log_handle=log_handle, log_path=log_path)
         return
@@ -3122,6 +3206,8 @@ def main():
             )
         if args.filter_upgradeable:
             parser.error("--filter-upgradeable can only be used with action 'port'")
+        if args.filter_tag:
+            parser.error("--filter-tag can only be used with action 'port'")
         if args.create_github:
             parser.error("--create-github can only be used with action 'port'")
         if args.push_github:

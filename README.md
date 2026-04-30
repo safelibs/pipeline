@@ -32,6 +32,7 @@ python3 safelibs.py port libyaml --from upgrade
 python3 safelibs.py port libyaml --from-last
 python3 safelibs.py port libyaml --dry-run
 python3 safelibs.py port libyaml --filter-upgradeable
+python3 safelibs.py port libyaml --filter-tag 04-test
 python3 safelibs.py port libyaml --create-github --github-repo OWNER/libyaml-safe
 python3 safelibs.py port libyaml --push-github
 python3 safelibs.py port libyaml --github-repo OWNER/libyaml-safe --push-github
@@ -48,8 +49,10 @@ The runner always uses `PORTS_DIR/port-LIBNAME` as the workdir. By default
 override it. The workdir is treated as a managed checkout for
 `https://github.com/safelibs/port-LIBNAME.git`. Managed checkouts are cloned
 when the GitHub repo exists, fetched before use, and fast-forward pulled when
-the worktree is clean. If the GitHub repo does not exist yet, the runner
-initializes a fresh local git repo in that path. Use `--no-auto-pull` to skip
+the worktree is clean. If the GitHub repo does not exist yet, the runner falls
+back to cloning `safelibs/port-template` as the scaffold and rewrites `origin`
+to the eventual `port-LIBNAME` URL; if the template clone also fails, it
+initializes a fresh local git repo. Use `--no-auto-pull` to skip
 clone/fetch/pull, and `--github-owner` or `--github-prefix` for non-default port
 repo namespaces.
 
