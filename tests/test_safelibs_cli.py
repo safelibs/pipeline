@@ -2731,3 +2731,287 @@ def test_do_phase_works_in_round_robin(
     for repo in (foo_workdir, bar_workdir):
         assert (repo / "runs.log").read_text(encoding="utf-8") == "02-setup\n"
         assert (repo / "02-setup-observed.txt").read_text(encoding="utf-8") == "head\n"
+
+
+def _validator_payload(port_lib_status: dict[str, int]) -> dict[str, object]:
+    """Build a minimal site-data.json payload with the given {libname: failed}."""
+    return {
+        "schema_version": 2,
+        "proofs": [
+            {
+                "mode": "original",
+                "suite": {"name": "ubuntu-24.04-original-apt"},
+                "libraries": [
+                    {
+                        "library": name,
+                        "totals": {"cases": 115, "passed": 115, "failed": 0},
+                    }
+                    for name in port_lib_status
+                ],
+            },
+            {
+                "mode": "port",
+                "suite": {"name": "ubuntu-24.04-original-apt"},
+                "libraries": [
+                    {
+                        "library": name,
+                        "totals": {
+                            "cases": 115,
+                            "passed": 115 - failed,
+                            "failed": failed,
+                        },
+                    }
+                    for name, failed in port_lib_status.items()
+                ],
+            },
+        ],
+    }
+
+
+class _FakeUrlopen:
+    def __init__(self, payload: object) -> None:
+        self._payload = payload
+        self.calls: list[str] = []
+
+    def __call__(self, url: str, timeout: float = 0) -> "_FakeUrlopen._Ctx":
+        self.calls.append(url)
+        return self._Ctx(self._payload)
+
+    class _Ctx:
+        def __init__(self, payload: object) -> None:
+            self._payload = payload
+
+        def __enter__(self) -> "_FakeUrlopen._Ctx":
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(self._payload).encode("utf-8")
+
+
+def test_fetch_non_verifying_libraries_returns_only_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _validator_payload(
+        {"cjson": 0, "glib": 115, "libpng": 34, "libwebp": 0, "libcurl": 115}
+    )
+    fake = _FakeUrlopen(payload)
+    monkeypatch.setattr(safelibs.urllib.request, "urlopen", fake)
+
+    result = safelibs._fetch_non_verifying_libraries(
+        "https://example.invalid/site-data.json"
+    )
+
+    assert result == ["glib", "libpng", "libcurl"]
+    assert fake.calls == ["https://example.invalid/site-data.json"]
+
+
+def test_fetch_non_verifying_libraries_exits_on_network_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def boom(url: str, timeout: float = 0) -> None:
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(safelibs.urllib.request, "urlopen", boom)
+
+    with pytest.raises(SystemExit) as exc_info:
+        safelibs._fetch_non_verifying_libraries("https://example.invalid/x.json")
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "Failed to fetch validator data from" in err
+    assert "connection refused" in err
+
+
+def test_fetch_non_verifying_libraries_exits_when_no_port_proof(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    payload = {"schema_version": 2, "proofs": []}
+    monkeypatch.setattr(safelibs.urllib.request, "urlopen", _FakeUrlopen(payload))
+
+    with pytest.raises(SystemExit) as exc_info:
+        safelibs._fetch_non_verifying_libraries("https://example.invalid/x.json")
+    assert exc_info.value.code == 1
+    assert "no port-mode proof" in capsys.readouterr().err
+
+
+def test_from_validator_drives_libname_list_into_port_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    pipeline_dir = tmp_path / "pipeline"
+    pipeline_dir.mkdir()
+    _write_pipeline_script(
+        pipeline_dir / "01-recon.py",
+        "\n".join(
+            [
+                "with (workdir / 'runs.log').open('a', encoding='utf-8') as handle:",
+                "    handle.write(sys.argv[1] + '\\n')",
+            ]
+        ),
+    )
+
+    ports_dir = tmp_path / "ports"
+    libfoo_workdir = ports_dir / "port-libfoo"
+    libbar_workdir = ports_dir / "port-libbar"
+
+    payload = _validator_payload({"libfoo": 4, "libnope": 0, "libbar": 1})
+    monkeypatch.setattr(safelibs.urllib.request, "urlopen", _FakeUrlopen(payload))
+
+    monkeypatch.setattr(safelibs, "PIPELINE_DIR", os.fspath(pipeline_dir))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "safelibs.py",
+            "port",
+            "--ports-dir",
+            os.fspath(ports_dir),
+            "--no-auto-pull",
+            "--from-validator",
+        ],
+    )
+
+    safelibs.main()
+
+    out = capsys.readouterr().out
+    assert "--from-validator: 2 non-verifying libraries" in out
+    assert "libfoo, libbar" in out
+    # Both failing libs were ported; the verifying one was skipped.
+    assert (libfoo_workdir / "runs.log").read_text(encoding="utf-8") == "libfoo\n"
+    assert (libbar_workdir / "runs.log").read_text(encoding="utf-8") == "libbar\n"
+    assert not (ports_dir / "port-libnope").exists()
+
+
+def test_from_validator_rejects_explicit_libnames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "safelibs.py",
+            "port",
+            "libfoo",
+            "--ports-dir",
+            os.fspath(tmp_path / "ports"),
+            "--no-auto-pull",
+            "--from-validator",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        safelibs.main()
+    err = capsys.readouterr().err
+    assert "--from-validator cannot be combined with explicit LIBNAME args" in err
+
+
+def test_from_validator_with_no_failing_libs_exits_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    pipeline_dir = tmp_path / "pipeline"
+    pipeline_dir.mkdir()
+    _write_pipeline_script(
+        pipeline_dir / "01-recon.py",
+        "raise AssertionError('should not run when validator has no failures')",
+    )
+
+    payload = _validator_payload({"cjson": 0, "libwebp": 0})
+    monkeypatch.setattr(safelibs.urllib.request, "urlopen", _FakeUrlopen(payload))
+    monkeypatch.setattr(safelibs, "PIPELINE_DIR", os.fspath(pipeline_dir))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "safelibs.py",
+            "port",
+            "--ports-dir",
+            os.fspath(tmp_path / "ports"),
+            "--no-auto-pull",
+            "--from-validator",
+        ],
+    )
+
+    safelibs.main()
+
+    out = capsys.readouterr().out
+    assert "No non-verifying libraries reported" in out
+
+
+def test_from_validator_works_with_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    pipeline_dir = tmp_path / "pipeline"
+    pipeline_dir.mkdir()
+    _write_pipeline_script(pipeline_dir / "01-recon.py", "pass")
+
+    ports_dir = tmp_path / "ports"
+    workdir = ports_dir / "port-libfoo"
+    _init_workdir_repo(workdir)
+    _commit_state(workdir, "phase1", "phase1")
+    _git(workdir, "tag", "libfoo/01-recon")
+
+    payload = _validator_payload({"libfoo": 1, "libgood": 0})
+    monkeypatch.setattr(safelibs.urllib.request, "urlopen", _FakeUrlopen(payload))
+    monkeypatch.setattr(safelibs, "PIPELINE_DIR", os.fspath(pipeline_dir))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "safelibs.py",
+            "status",
+            "--ports-dir",
+            os.fspath(ports_dir),
+            "--no-auto-pull",
+            "--from-validator",
+        ],
+    )
+
+    safelibs.main()
+
+    out = capsys.readouterr().out
+    assert "--from-validator: 1 non-verifying libraries" in out
+    # Status path reports on libfoo (the failing lib pulled from validator).
+    assert "libfoo" in out
+
+
+def test_from_validator_url_is_overridable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pipeline_dir = tmp_path / "pipeline"
+    pipeline_dir.mkdir()
+    _write_pipeline_script(pipeline_dir / "01-recon.py", "pass")
+
+    payload = _validator_payload({"libfoo": 1})
+    fake = _FakeUrlopen(payload)
+    monkeypatch.setattr(safelibs.urllib.request, "urlopen", fake)
+    monkeypatch.setattr(safelibs, "PIPELINE_DIR", os.fspath(pipeline_dir))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "safelibs.py",
+            "port",
+            "--ports-dir",
+            os.fspath(tmp_path / "ports"),
+            "--no-auto-pull",
+            "--from-validator",
+            "--validator-url",
+            "https://elsewhere.invalid/data.json",
+        ],
+    )
+
+    safelibs.main()
+
+    assert fake.calls == ["https://elsewhere.invalid/data.json"]

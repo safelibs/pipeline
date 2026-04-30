@@ -7,6 +7,7 @@ Usage:
     safelibs.py port [libname ...]
     safelibs.py port --jobs 4
     safelibs.py port [libname ...] --filter-upgradeable
+    safelibs.py port --from-validator
     safelibs.py port [libname ...] -L [logfile]
     safelibs.py port [libname ...] --from 01-recon
     safelibs.py port [libname ...] --from 02-setup
@@ -61,6 +62,7 @@ DEFAULT_LOG_DIR = "/tmp"
 _USE_DEFAULT_LOG_PATH = object()
 DEFAULT_GIT_USER_NAME = "SafeLibs Pipeline"
 DEFAULT_GIT_USER_EMAIL = "safelibs@example.invalid"
+DEFAULT_VALIDATOR_URL = "https://safelibs.org/validator/site-data.json"
 PHASE_SKIPPED_EXIT_CODE = 80
 JUVENAL_BACKEND_ENV = "JUVENAL_BACKEND"
 JUVENAL_BACKEND_CHOICES = ("codex", "claude")
@@ -891,6 +893,53 @@ def _ubuntu_series_codename(log_handle=None):
         if codename:
             return codename
     return None
+
+
+def _fetch_non_verifying_libraries(url, log_handle=None, timeout=15):
+    """Return libraries whose port-mode proof has at least one failing testcase.
+
+    The validator at https://safelibs.org/validator publishes a site-data.json
+    document with one proof per (mode, suite). The port-mode proof lists each
+    library along with totals; a library is "non-verifying" when totals.failed
+    is greater than zero. Exits the process with a clear error on any HTTP or
+    parse failure so callers don't proceed with an empty/garbled list.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            payload = json.load(response)
+    except Exception as exc:
+        _emit(
+            f"Failed to fetch validator data from {url}: {exc}",
+            log_handle=log_handle,
+            stream=sys.stderr,
+        )
+        sys.exit(1)
+
+    proofs = payload.get("proofs", []) if isinstance(payload, dict) else []
+    port_proofs = [p for p in proofs if isinstance(p, dict) and p.get("mode") == "port"]
+    if not port_proofs:
+        _emit(
+            f"Validator data at {url} contains no port-mode proof.",
+            log_handle=log_handle,
+            stream=sys.stderr,
+        )
+        sys.exit(1)
+
+    libs = []
+    for proof in port_proofs:
+        for entry in proof.get("libraries", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("library")
+            totals = entry.get("totals") or {}
+            failed = totals.get("failed", 0)
+            try:
+                failing = int(failed) > 0
+            except (TypeError, ValueError):
+                failing = False
+            if isinstance(name, str) and name and failing and name not in libs:
+                libs.append(name)
+    return libs
 
 
 def _launchpad_source_versions(source_package, log_handle=None):
@@ -1894,6 +1943,24 @@ def _build_parser():
             "For 'port', first check whether the checked-out source has a "
             "newer upstream Ubuntu package version available; skip the port "
             "when it does not."
+        ),
+    )
+    parser.add_argument(
+        "--from-validator",
+        action="store_true",
+        help=(
+            "Use libraries flagged as non-verifying in port-mode at "
+            "https://safelibs.org/validator as the LIBNAME list. "
+            "Cannot be combined with explicit LIBNAME args."
+        ),
+    )
+    parser.add_argument(
+        "--validator-url",
+        default=DEFAULT_VALIDATOR_URL,
+        metavar="URL",
+        help=(
+            "URL of the validator site-data.json used by --from-validator. "
+            f"Defaults to {DEFAULT_VALIDATOR_URL}."
         ),
     )
     parser.add_argument(
@@ -3030,6 +3097,23 @@ def main():
     if jobs_was_supplied and args.jobs < 1:
         parser.error("--jobs must be a positive integer")
     libnames = list(args.libname or [])
+    if args.from_validator:
+        if libnames:
+            parser.error(
+                "--from-validator cannot be combined with explicit LIBNAME args"
+            )
+        libnames = _fetch_non_verifying_libraries(args.validator_url)
+        if not libnames:
+            print(
+                f"No non-verifying libraries reported at {args.validator_url}; "
+                "nothing to do."
+            )
+            return
+        print(
+            f"--from-validator: {len(libnames)} non-verifying libraries from "
+            f"{args.validator_url}: {', '.join(libnames)}"
+        )
+        args.libname = list(libnames)
     if args.action in {"status", "sync"}:
         if args.from_phase or args.from_last or args.continue_from or args.do_phase:
             parser.error(
