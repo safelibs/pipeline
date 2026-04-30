@@ -2453,3 +2453,281 @@ def test_from_last_noops_when_latest_tag_is_final_phase(
     assert "Scripts: []" in out
     assert (workdir / "state.txt").read_text(encoding="utf-8") == "phase3\n"
     assert not (workdir / "runs.log").exists()
+
+
+def _write_phase_script_records_state(pipeline_dir: Path, phase: str) -> None:
+    _write_pipeline_script(
+        pipeline_dir / f"{phase}.py",
+        "\n".join(
+            [
+                "with (workdir / 'runs.log').open('a', encoding='utf-8') as handle:",
+                f"    handle.write('{phase}\\n')",
+                "observed = (workdir / 'state.txt').read_text(encoding='utf-8')",
+                f"(workdir / '{phase}-observed.txt').write_text(observed, encoding='utf-8')",
+            ]
+        ),
+    )
+
+
+def test_continue_resumes_from_head_without_resetting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    pipeline_dir = tmp_path / "pipeline"
+    pipeline_dir.mkdir()
+    for phase in ("01-recon", "02-setup", "03-port", "04-test"):
+        _write_phase_script_records_state(pipeline_dir, phase)
+
+    workdir = _managed_workdir(tmp_path)
+    _init_workdir_repo(workdir)
+    _commit_state(workdir, "phase1", "phase1")
+    _git(workdir, "tag", "libfoo/01-recon")
+    _commit_state(workdir, "phase2", "phase2")
+    _git(workdir, "tag", "libfoo/02-setup")
+    _commit_state(workdir, "phase3", "phase3")
+    _git(workdir, "tag", "libfoo/03-port")
+    # Local edit on top of 03-port that --from-last would discard.
+    _commit_state(workdir, "local-tweak", "local-tweak")
+    head_before = _git(workdir, "rev-parse", "HEAD").stdout.strip()
+
+    monkeypatch.setattr(safelibs, "PIPELINE_DIR", os.fspath(pipeline_dir))
+    monkeypatch.setattr(sys, "argv", _safelibs_argv(workdir, "--continue"))
+
+    safelibs.main()
+
+    out = capsys.readouterr().out
+    assert "continuing from HEAD with 04-test" in out
+    assert (workdir / "runs.log").read_text(encoding="utf-8") == "04-test\n"
+    # Phase saw the local-tweak state, NOT phase3 -- proves no reset happened.
+    assert (workdir / "04-test-observed.txt").read_text(encoding="utf-8") == "local-tweak\n"
+
+    head_after = _git(workdir, "rev-parse", "HEAD").stdout.strip()
+    # The 04-test tag should land on HEAD (which is at-or-after head_before).
+    tag_commit = _git(workdir, "rev-parse", "libfoo/04-test").stdout.strip()
+    assert tag_commit == head_after
+    # The local-tweak commit must still be reachable from HEAD.
+    _git(workdir, "merge-base", "--is-ancestor", head_before, head_after)
+
+
+def test_continue_starts_from_beginning_without_matching_tags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    pipeline_dir = tmp_path / "pipeline"
+    pipeline_dir.mkdir()
+    _write_phase_script_records_state(pipeline_dir, "01-recon")
+
+    workdir = _managed_workdir(tmp_path)
+    _init_workdir_repo(workdir)
+    _commit_state(workdir, "head", "head")
+
+    monkeypatch.setattr(safelibs, "PIPELINE_DIR", os.fspath(pipeline_dir))
+    monkeypatch.setattr(sys, "argv", _safelibs_argv(workdir, "--continue"))
+
+    safelibs.main()
+
+    out = capsys.readouterr().out
+    assert "No phase tags reachable from HEAD for 'libfoo'" in out
+    assert (workdir / "runs.log").read_text(encoding="utf-8") == "01-recon\n"
+
+
+def test_continue_noops_when_latest_tag_is_final_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    pipeline_dir = tmp_path / "pipeline"
+    pipeline_dir.mkdir()
+    for phase in ("01-recon", "02-setup"):
+        _write_phase_script_records_state(pipeline_dir, phase)
+
+    workdir = _managed_workdir(tmp_path)
+    _init_workdir_repo(workdir)
+    _commit_state(workdir, "phase1", "phase1")
+    _git(workdir, "tag", "libfoo/01-recon")
+    _commit_state(workdir, "phase2", "phase2")
+    _git(workdir, "tag", "libfoo/02-setup")
+
+    monkeypatch.setattr(safelibs, "PIPELINE_DIR", os.fspath(pipeline_dir))
+    monkeypatch.setattr(sys, "argv", _safelibs_argv(workdir, "--continue"))
+
+    safelibs.main()
+
+    out = capsys.readouterr().out
+    assert "no remaining phases to run." in out
+    assert "Scripts: []" in out
+    assert not (workdir / "runs.log").exists()
+
+
+def test_do_phase_reruns_specified_phase_on_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    pipeline_dir = tmp_path / "pipeline"
+    pipeline_dir.mkdir()
+    for phase in ("01-recon", "02-setup", "03-port", "04-test"):
+        _write_phase_script_records_state(pipeline_dir, phase)
+
+    workdir = _managed_workdir(tmp_path)
+    _init_workdir_repo(workdir)
+    _commit_state(workdir, "phase1", "phase1")
+    _git(workdir, "tag", "libfoo/01-recon")
+    _commit_state(workdir, "phase2", "phase2")
+    _git(workdir, "tag", "libfoo/02-setup")
+    _commit_state(workdir, "phase3", "phase3")
+    _git(workdir, "tag", "libfoo/03-port")
+    _commit_state(workdir, "phase4", "phase4")
+    _git(workdir, "tag", "libfoo/04-test")
+    _commit_state(workdir, "head", "head")
+    head_before = _git(workdir, "rev-parse", "HEAD").stdout.strip()
+
+    monkeypatch.setattr(safelibs, "PIPELINE_DIR", os.fspath(pipeline_dir))
+    monkeypatch.setattr(
+        sys, "argv", _safelibs_argv(workdir, "--do-phase", "03-port")
+    )
+
+    safelibs.main()
+
+    out = capsys.readouterr().out
+    assert "--do-phase: re-running 03-port on HEAD without reset." in out
+    # Only 03-port ran, exactly once -- max_phases caps it at one phase.
+    assert (workdir / "runs.log").read_text(encoding="utf-8") == "03-port\n"
+    # Phase saw HEAD state (not phase2 or phase3 from the tags) -- no reset.
+    assert (workdir / "03-port-observed.txt").read_text(encoding="utf-8") == "head\n"
+
+    head_after = _git(workdir, "rev-parse", "HEAD").stdout.strip()
+    assert head_after == head_before
+    # Tag now points at HEAD.
+    assert _git(workdir, "rev-parse", "libfoo/03-port").stdout.strip() == head_after
+    # 04-test tag is unchanged and still exists (we never reset away from HEAD).
+    _git(workdir, "rev-parse", "libfoo/04-test")
+
+
+def test_do_phase_rejects_unknown_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    pipeline_dir = tmp_path / "pipeline"
+    pipeline_dir.mkdir()
+    _write_phase_script_records_state(pipeline_dir, "01-recon")
+
+    workdir = _managed_workdir(tmp_path)
+    _init_workdir_repo(workdir)
+    _commit_state(workdir, "head", "head")
+
+    monkeypatch.setattr(safelibs, "PIPELINE_DIR", os.fspath(pipeline_dir))
+    monkeypatch.setattr(
+        sys, "argv", _safelibs_argv(workdir, "--do-phase", "99-bogus")
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        safelibs.main()
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "Unknown phase '99-bogus'" in err
+
+
+def test_continue_and_do_phase_are_mutually_exclusive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    workdir = _managed_workdir(tmp_path)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _safelibs_argv(workdir, "--continue", "--do-phase", "02-setup"),
+    )
+
+    with pytest.raises(SystemExit):
+        safelibs.main()
+    err = capsys.readouterr().err
+    assert "not allowed with argument" in err
+
+
+def test_continue_works_in_round_robin_with_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    pipeline_dir = tmp_path / "pipeline"
+    pipeline_dir.mkdir()
+    for phase in ("01-recon", "02-setup", "03-port"):
+        _write_phase_script_records_state(pipeline_dir, phase)
+
+    ports_dir = tmp_path / "ports"
+    foo_workdir = ports_dir / "port-libfoo"
+    bar_workdir = ports_dir / "port-libbar"
+
+    _init_workdir_repo(foo_workdir)
+    _commit_state(foo_workdir, "phase1", "phase1")
+    _git(foo_workdir, "tag", "libfoo/01-recon")
+    _commit_state(foo_workdir, "foo-tweak", "foo-tweak")
+
+    _init_workdir_repo(bar_workdir)
+    _commit_state(bar_workdir, "phase1", "phase1")
+    _git(bar_workdir, "tag", "libbar/01-recon")
+    _commit_state(bar_workdir, "phase2", "phase2")
+    _git(bar_workdir, "tag", "libbar/02-setup")
+    _commit_state(bar_workdir, "bar-tweak", "bar-tweak")
+
+    monkeypatch.setattr(safelibs, "PIPELINE_DIR", os.fspath(pipeline_dir))
+    monkeypatch.setattr(safelibs, "_list_github_port_repos", lambda *a, **k: [])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "safelibs.py",
+            "port",
+            "--ports-dir",
+            os.fspath(ports_dir),
+            "--no-auto-pull",
+            "--continue",
+            "--jobs",
+            "2",
+        ],
+    )
+
+    safelibs.main()
+
+    # Each port advances by exactly one phase (round-robin semantics) and sees
+    # its local tweak as state, proving HEAD was not reset.
+    assert (foo_workdir / "runs.log").read_text(encoding="utf-8") == "02-setup\n"
+    assert (foo_workdir / "02-setup-observed.txt").read_text(encoding="utf-8") == "foo-tweak\n"
+    assert (bar_workdir / "runs.log").read_text(encoding="utf-8") == "03-port\n"
+    assert (bar_workdir / "03-port-observed.txt").read_text(encoding="utf-8") == "bar-tweak\n"
+
+
+def test_do_phase_works_in_round_robin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    pipeline_dir = tmp_path / "pipeline"
+    pipeline_dir.mkdir()
+    for phase in ("01-recon", "02-setup", "03-port"):
+        _write_phase_script_records_state(pipeline_dir, phase)
+
+    ports_dir = tmp_path / "ports"
+    foo_workdir = ports_dir / "port-libfoo"
+    bar_workdir = ports_dir / "port-libbar"
+
+    for repo, libname in ((foo_workdir, "libfoo"), (bar_workdir, "libbar")):
+        _init_workdir_repo(repo)
+        _commit_state(repo, "phase1", "phase1")
+        _git(repo, "tag", f"{libname}/01-recon")
+        _commit_state(repo, "phase2", "phase2")
+        _git(repo, "tag", f"{libname}/02-setup")
+        _commit_state(repo, "head", "head")
+
+    monkeypatch.setattr(safelibs, "PIPELINE_DIR", os.fspath(pipeline_dir))
+    monkeypatch.setattr(safelibs, "_list_github_port_repos", lambda *a, **k: [])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "safelibs.py",
+            "port",
+            "--ports-dir",
+            os.fspath(ports_dir),
+            "--no-auto-pull",
+            "--do-phase",
+            "02-setup",
+        ],
+    )
+
+    safelibs.main()
+
+    # Both ports re-ran 02-setup on HEAD even though they were already past it.
+    for repo in (foo_workdir, bar_workdir):
+        assert (repo / "runs.log").read_text(encoding="utf-8") == "02-setup\n"
+        assert (repo / "02-setup-observed.txt").read_text(encoding="utf-8") == "head\n"

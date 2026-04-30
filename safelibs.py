@@ -11,6 +11,8 @@ Usage:
     safelibs.py port [libname ...] --from 01-recon
     safelibs.py port [libname ...] --from 02-setup
     safelibs.py port [libname ...] --from-last
+    safelibs.py port [libname ...] --continue
+    safelibs.py port [libname ...] --do-phase 05-validate
     safelibs.py port [libname ...] --dry-run
     safelibs.py port libname --create-github --github-repo OWNER/REPO
     safelibs.py port [libname ...] --push-github
@@ -582,6 +584,7 @@ def _sync_port_workdir(
     libname=None,
     log_handle=None,
     dry_run=False,
+    template_repo_slug=None,
 ):
     remote_url = _github_remote_url(repo_slug)
     if _is_git_worktree(workdir):
@@ -617,16 +620,51 @@ def _sync_port_workdir(
         )
         return "non-git"
 
+    template_url = (
+        _github_remote_url(template_repo_slug) if template_repo_slug else None
+    )
+
     if dry_run:
         _emit_dry_run(
             f"would clone {remote_url} into {workdir} if available",
             log_handle=log_handle,
         )
+        if template_url:
+            _emit_dry_run(
+                f"would fall back to cloning {template_url} as the port scaffold "
+                f"and rewrite {remote} to {remote_url}",
+                log_handle=log_handle,
+            )
         return "dry-run"
 
     if _clone_port_repo(remote_url, workdir, log_handle=log_handle):
         return "cloned"
+
+    if template_url and _clone_port_repo(
+        template_url, workdir, log_handle=log_handle
+    ):
+        _reset_origin_after_template_clone(
+            workdir, remote, remote_url, log_handle=log_handle
+        )
+        return "templated"
+
     return "missing"
+
+
+def _reset_origin_after_template_clone(workdir, remote, remote_url, log_handle=None):
+    existing = _remote_url(workdir, remote, log_handle=log_handle)
+    if existing is not None:
+        _emit(
+            f"Removing template remote {remote} ({existing}) from {workdir}",
+            log_handle=log_handle,
+        )
+        _run_checked_command(
+            ["git", "remote", "remove", remote],
+            cwd=workdir,
+            error_message=f"Failed to remove git remote {remote}",
+            log_handle=log_handle,
+        )
+    _ensure_remote_if_missing(workdir, remote, remote_url, log_handle=log_handle)
 
 
 def _safe_read_text(path):
@@ -1899,6 +1937,20 @@ def _build_parser():
         action="store_true",
         help="Resume from the phase after the most recent existing phase tag.",
     )
+    resume_group.add_argument(
+        "--continue",
+        dest="continue_from",
+        action="store_true",
+        help="Resume from HEAD: detect the latest phase tag reachable from HEAD "
+             "and run the next phase onward without resetting the workdir.",
+    )
+    resume_group.add_argument(
+        "--do-phase",
+        dest="do_phase",
+        metavar="PHASE",
+        help="Re-run a single phase (e.g. '05-validate') on HEAD without resetting, "
+             "even if it is already tagged.",
+    )
     parser.add_argument(
         "--github-repo",
         metavar="OWNER/REPO",
@@ -1998,7 +2050,12 @@ def _sync_one(args, log_handle=None):
         libname=libname,
         log_handle=log_handle,
         dry_run=dry_run,
+        template_repo_slug=_template_repo_slug(github_owner, github_prefix),
     )
+
+
+def _template_repo_slug(owner, prefix):
+    return f"{owner}/{_port_repo_name('template', prefix)}"
 
 
 def _sync_all(args, log_handle=None):
@@ -2031,6 +2088,7 @@ def _sync_all(args, log_handle=None):
             libname=repo["libname"],
             log_handle=log_handle,
             dry_run=dry_run,
+            template_repo_slug=_template_repo_slug(github_owner, github_prefix),
         )
 
 
@@ -2053,6 +2111,7 @@ def _status_all(args, phases, log_handle=None):
                 libname=repo["libname"],
                 log_handle=log_handle,
                 dry_run=dry_run,
+                template_repo_slug=_template_repo_slug(github_owner, github_prefix),
             )
         statuses.append(
             _port_status(
@@ -2099,6 +2158,7 @@ def _status_one(args, phases, log_handle=None):
             libname=libname,
             log_handle=log_handle,
             dry_run=dry_run,
+            template_repo_slug=_template_repo_slug(github_owner, github_prefix),
         )
 
     _emit_status(
@@ -2157,6 +2217,7 @@ def _run_port_one(
             libname=libname,
             log_handle=log_handle,
             dry_run=dry_run,
+            template_repo_slug=_template_repo_slug(github_owner, github_prefix),
         )
 
     if getattr(args, "filter_upgradeable", False):
@@ -2185,11 +2246,55 @@ def _run_port_one(
     # Determine which scripts to run
     start_index = 0
     from_phase = args.from_phase
+    continue_from = getattr(args, "continue_from", False)
+    do_phase = getattr(args, "do_phase", None)
     reset_tag = None
     filter_upgradeable = getattr(args, "filter_upgradeable", False)
     if job_reporter is not None:
         job_reporter.set_status("planning", detail="Determining resume point")
-    if args.from_last:
+    if do_phase:
+        do_index = _find_phase_index(phases, do_phase)
+        # Existence already validated in _run_pipeline; assert defensively.
+        assert do_index is not None
+        start_index = do_index
+        if max_phases is None:
+            max_phases = 1
+        _emit(
+            f"--do-phase: re-running {phases[do_index]} on HEAD without reset.",
+            log_handle=log_handle,
+        )
+    elif continue_from:
+        if _workdir_has_git_history(workdir, log_handle=log_handle):
+            last_tagged_index = _find_last_tagged_phase_index(
+                workdir,
+                libname,
+                phases,
+                log_handle=log_handle,
+            )
+        else:
+            last_tagged_index = None
+
+        if last_tagged_index is None:
+            _emit(
+                f"No phase tags reachable from HEAD for '{libname}'; "
+                "starting from beginning.",
+                log_handle=log_handle,
+            )
+        elif last_tagged_index == len(phases) - 1:
+            start_index = len(phases)
+            _emit(
+                f"Last completed phase tag is {libname}/{phases[last_tagged_index]}; "
+                "no remaining phases to run.",
+                log_handle=log_handle,
+            )
+        else:
+            start_index = last_tagged_index + 1
+            _emit(
+                f"Last completed phase tag is {libname}/{phases[last_tagged_index]}; "
+                f"continuing from HEAD with {phases[start_index]}.",
+                log_handle=log_handle,
+            )
+    elif args.from_last:
         if _workdir_has_git_history(workdir, log_handle=log_handle):
             last_tagged_index = _find_last_tagged_phase_index(
                 workdir,
@@ -2615,7 +2720,11 @@ def _round_robin_port_args(args, repo, *, filter_upgradeable, dry_run):
     per_args.libname = repo["libname"]
     if repo.get("repo_slug"):
         per_args.github_repo = repo["repo_slug"]
-    if not per_args.from_phase:
+    if (
+        not per_args.from_phase
+        and not getattr(per_args, "continue_from", False)
+        and not getattr(per_args, "do_phase", None)
+    ):
         per_args.from_last = True
     per_args.quiet_unchanged_filter = filter_upgradeable and not dry_run
     return per_args
@@ -2892,6 +3001,14 @@ def _run_pipeline(args, log_handle=None, log_path=None):
         )
         sys.exit(1)
 
+    if args.do_phase and _find_phase_index(phases, args.do_phase) is None:
+        _emit(
+            f"Unknown phase '{args.do_phase}'. Available: {phases}",
+            log_handle=log_handle,
+            stream=sys.stderr,
+        )
+        sys.exit(1)
+
     if not libnames:
         _round_robin_ports(args, scripts, phases, log_handle=log_handle, log_path=log_path)
         return
@@ -2914,8 +3031,11 @@ def main():
         parser.error("--jobs must be a positive integer")
     libnames = list(args.libname or [])
     if args.action in {"status", "sync"}:
-        if args.from_phase or args.from_last:
-            parser.error("--from and --from-last can only be used with action 'port'")
+        if args.from_phase or args.from_last or args.continue_from or args.do_phase:
+            parser.error(
+                "--from, --from-last, --continue, and --do-phase can only be used "
+                "with action 'port'"
+            )
         if args.filter_upgradeable:
             parser.error("--filter-upgradeable can only be used with action 'port'")
         if args.create_github:
