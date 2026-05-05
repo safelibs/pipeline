@@ -2505,6 +2505,7 @@ def _run_port_one(
 
     counted_phases = 0
     last_phase = None
+    phase_failure_exit_code = None
     for index, script in enumerate(scripts_to_run, start=1):
         if max_phases is not None and not dry_run and counted_phases >= max_phases:
             break
@@ -2555,7 +2556,8 @@ def _run_port_one(
                 log_handle=log_handle,
                 stream=sys.stderr,
             )
-            sys.exit(returncode)
+            phase_failure_exit_code = returncode
+            break
 
         tag = f"{libname}/{phase}"
         if job_reporter is not None:
@@ -2585,7 +2587,8 @@ def _run_port_one(
                 log_handle=log_handle,
                 stream=sys.stderr,
             )
-            sys.exit(1)
+            phase_failure_exit_code = 1
+            break
         _emit(f"Tagged {tag}", log_handle=log_handle)
         if phase_skipped and max_phases is not None:
             _emit(
@@ -2643,6 +2646,13 @@ def _run_port_one(
                 detail="Dry run plan complete",
             )
         _emit(f"\nDry run complete. Output would be in {workdir}", log_handle=log_handle)
+    elif phase_failure_exit_code is not None:
+        _emit(
+            f"\nPipeline aborted in {workdir}; pushed any committed work before exiting.",
+            log_handle=log_handle,
+            stream=sys.stderr,
+        )
+        sys.exit(phase_failure_exit_code)
     else:
         if job_reporter is not None:
             final_phase = last_phase or "-"
